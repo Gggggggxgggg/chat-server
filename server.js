@@ -1,259 +1,188 @@
-const WebSocket = require("ws");
-const crypto = require("crypto");
-const fs = require("fs");
-const sqlite3 = require("sqlite3").verbose();
-
-const PORT = process.env.PORT || 8080;
-const server = new WebSocket.Server({ port: PORT });
-
-const users = new Map();
+let ws;
+let room = "global";
+let typingTimeout;
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
+let myAvatar = DEFAULT_AVATAR;
 
-// ---------------- DATABASE ----------------
+// ---------------- CONNECT ----------------
+function connect(){
+ws = new WebSocket("wss://chat-server-1-7wdv.onrender.com");
 
-if (!fs.existsSync("./database")) {
-    fs.mkdirSync("./database");
+ws.onmessage = (e)=>{
+const m = JSON.parse(e.data);
+
+// AUTH
+if(m.type === "login_ok"){
+document.getElementById("auth").style.display = "none";
 }
 
-const db = new sqlite3.Database("./database/chat.db");
-
-// USERS TABLE
-db.run(`
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE,
-    password TEXT
-)
-`);
-
-// MESSAGES TABLE
-db.run(`
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    room TEXT,
-    name TEXT,
-    type TEXT,
-    text TEXT,
-    fileType TEXT,
-    fileName TEXT,
-    data TEXT,
-    time INTEGER
-)
-`);
-
-// ---------------- HELPERS ----------------
-
-function broadcastRoom(room, data) {
-    const msg = JSON.stringify(data);
-
-    server.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            const u = users.get(client);
-            if (u && u.room === room) {
-                client.send(msg);
-            }
-        }
-    });
+// ERROR
+if(m.type === "error"){
+document.getElementById("err").innerText = m.text;
 }
 
-function sendOnline(room) {
-    const list = [];
-
-    users.forEach(u => {
-        if (u.room === room && u.auth) {
-            list.push({
-                id: u.id,
-                name: u.name,
-                avatar: DEFAULT_AVATAR
-            });
-        }
-    });
-
-    broadcastRoom(room, {
-        type: "online",
-        users: list
-    });
+// ONLINE
+if(m.type === "online"){
+renderOnline(m.users);
 }
 
-// SAVE MESSAGE
-function saveMessage(room, name, data) {
-    db.run(`
-        INSERT INTO messages (room, name, type, text, fileType, fileName, data, time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-        room,
-        name,
-        data.type,
-        data.text || "",
-        data.fileType || "",
-        data.fileName || "",
-        data.data || "",
-        Date.now()
-    ]);
+// CHAT
+if(m.type === "text" || m.type === "file"){
+renderMessage(m);
 }
 
-// ---------------- SERVER ----------------
+// TYPING
+if(m.type === "typing"){
+showTyping(m.name);
+}
+};
+}
 
-server.on("connection", (ws) => {
+// ---------------- AUTH ----------------
+function login(){
+ws.send(JSON.stringify({
+type:"login",
+username:document.getElementById("user").value,
+password:document.getElementById("pass").value
+}));
+}
 
-    const user = {
-        id: crypto.randomUUID(),
-        name: null,
-        room: "global",
-        auth: false
-    };
+function register(){
+ws.send(JSON.stringify({
+type:"register",
+username:document.getElementById("user").value,
+password:document.getElementById("pass").value
+}));
+}
 
-    users.set(ws, user);
+// ---------------- SETTINGS ----------------
+function toggleSettings(){
+let s = document.getElementById("settings");
+s.style.display = (s.style.display === "flex") ? "none" : "flex";
+}
 
-    ws.on("message", (raw) => {
+function saveProfile(){
+ws.send(JSON.stringify({
+type:"update_profile",
+avatar: document.getElementById("avatarInput").value || myAvatar,
+birthday: document.getElementById("birthInput").value
+}));
 
-        let msg;
-        try {
-            msg = JSON.parse(raw.toString());
-        } catch {
-            return;
-        }
+toggleSettings();
+}
 
-        const u = users.get(ws);
-        if (!u) return;
+// ---------------- ONLINE ----------------
+function renderOnline(users){
+let box = document.getElementById("online");
+box.innerHTML = "";
 
-        // ---------------- REGISTER ----------------
-        if (msg.type === "register") {
+users.forEach(u=>{
+let d = document.createElement("div");
+d.className = "user";
 
-            const { username, password } = msg;
+d.innerHTML = `
+<img src="${u.avatar || DEFAULT_AVATAR}">
+<div>${u.name}</div>
+`;
 
-            db.get(
-                "SELECT * FROM users WHERE name = ?",
-                [username],
-                (err, row) => {
+box.appendChild(d);
+});
+}
 
-                    if (row) {
-                        ws.send(JSON.stringify({
-                            type: "error",
-                            text: "User already exists"
-                        }));
-                        return;
-                    }
+// ---------------- MESSAGE ----------------
+function renderMessage(m){
+let box = document.getElementById("messages");
 
-                    db.run(
-                        "INSERT INTO users (name, password) VALUES (?, ?)",
-                        [username, password]
-                    );
+let wrap = document.createElement("div");
+wrap.className = "msg other";
 
-                    u.name = username;
-                    u.auth = true;
+wrap.innerHTML = `
+<img class="avatar" src="${m.avatar || DEFAULT_AVATAR}">
+<div class="bubble">
+<b>${m.name}</b><br>
+</div>
+`;
 
-                    ws.send(JSON.stringify({
-                        type: "login_ok",
-                        name: username
-                    }));
+if(m.type === "text"){
+wrap.querySelector(".bubble").innerHTML += m.text;
+}
 
-                    sendOnline(u.room);
-                }
-            );
+if(m.type === "file"){
+if(m.fileType?.startsWith("image")){
+wrap.querySelector(".bubble").innerHTML += `<img src="${m.data}" style="max-width:200px;border-radius:8px">`;
+}else if(m.fileType?.startsWith("video")){
+wrap.querySelector(".bubble").innerHTML += `<video controls src="${m.data}" style="max-width:200px"></video>`;
+}else{
+wrap.querySelector(".bubble").innerHTML += m.fileName;
+}
+}
 
-            return;
-        }
+box.appendChild(wrap);
+box.scrollTop = box.scrollHeight;
+}
 
-        // ---------------- LOGIN ----------------
-        if (msg.type === "login") {
+// ---------------- SEND ----------------
+function send(){
+let input = document.getElementById("msg");
+if(!ws || !input.value.trim()) return;
 
-            const { username, password } = msg;
+ws.send(JSON.stringify({
+type:"text",
+text:input.value
+}));
 
-            db.get(
-                "SELECT * FROM users WHERE name = ? AND password = ?",
-                [username, password],
-                (err, row) => {
+input.value = "";
+}
 
-                    if (!row) {
-                        ws.send(JSON.stringify({
-                            type: "error",
-                            text: "Wrong login or password"
-                        }));
-                        return;
-                    }
+// ---------------- JOIN ----------------
+function join(r){
+room = r;
 
-                    u.name = username;
-                    u.auth = true;
+ws.send(JSON.stringify({
+type:"join",
+room:r
+}));
 
-                    ws.send(JSON.stringify({
-                        type: "login_ok",
-                        name: username
-                    }));
+document.getElementById("messages").innerHTML = "";
+}
 
-                    sendOnline(u.room);
-                }
-            );
+// ---------------- FILE ----------------
+document.getElementById("fileInput").onchange = (e)=>{
+let file = e.target.files[0];
+if(!file) return;
 
-            return;
-        }
+let reader = new FileReader();
 
-        // ---------------- BLOCK IF NOT AUTH ----------------
-        if (!u.auth) return;
+reader.onload = ()=>{
+ws.send(JSON.stringify({
+type:"file",
+fileName:file.name,
+fileType:file.type,
+data:reader.result
+}));
+};
 
-        // ---------------- JOIN ROOM ----------------
-        if (msg.type === "join") {
-            u.room = msg.room;
-            users.set(ws, u);
+reader.readAsDataURL(file);
+};
 
-            sendOnline(u.room);
-            return;
-        }
+// ---------------- TYPING ----------------
+document.getElementById("msg").addEventListener("input",()=>{
+if(!ws) return;
 
-        // ---------------- TEXT ----------------
-        if (msg.type === "text") {
-
-            const data = {
-                type: "text",
-                name: u.name,
-                avatar: DEFAULT_AVATAR,
-                text: msg.text
-            };
-
-            broadcastRoom(u.room, data);
-            saveMessage(u.room, u.name, data);
-        }
-
-        // ---------------- FILE ----------------
-        if (msg.type === "file") {
-
-            const data = {
-                type: "file",
-                name: u.name,
-                avatar: DEFAULT_AVATAR,
-                fileType: msg.fileType,
-                fileName: msg.fileName,
-                data: msg.data
-            };
-
-            broadcastRoom(u.room, data);
-            saveMessage(u.room, u.name, data);
-        }
-
-        // ---------------- TYPING ----------------
-        if (msg.type === "typing") {
-            broadcastRoom(u.room, {
-                type: "typing",
-                name: u.name
-            });
-        }
-
-        // ---------------- CHANGE NAME ----------------
-        if (msg.type === "name") {
-            u.name = msg.name;
-            users.set(ws, u);
-
-            sendOnline(u.room);
-        }
-    });
-
-    ws.on("close", () => {
-        const u = users.get(ws);
-        users.delete(ws);
-
-        if (u) sendOnline(u.room);
-    });
+ws.send(JSON.stringify({type:"typing"}));
 });
 
-console.log("🚀 Server running on port " + PORT);
+function showTyping(n){
+let el = document.getElementById("typing");
+el.textContent = n + " typing...";
+
+clearTimeout(typingTimeout);
+typingTimeout = setTimeout(()=> el.textContent = "", 1000);
+}
+
+// ---------------- SEND BUTTON ----------------
+document.getElementById("send").onclick = send;
+
+// START
+connect();
