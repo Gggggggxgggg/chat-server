@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chat</title>
+
+<style>
+body{
+margin:0;
+font-family:Arial;
+background:#1f1f1f;
+color:white;
+}
+
+#login{
+height:100vh;
+display:flex;
+flex-direction:column;
+justify-content:center;
+align-items:center;
+gap:10px;
+}
+
+#chat{
+display:none;
+height:100vh;
+flex-direction:column;
+}
+
+#messages{
+flex:1;
+overflow:auto;
+padding:10px;
+}
+
+.msg{
+background:#333;
+margin:5px;
+padding:8px;
+border-radius:8px;
+}
+
+.bottom{
+display:flex;
+}
+
+input{
+flex:1;
+padding:10px;
+font-size:16px;
+border:none;
+outline:none;
+}
+
+button{
+width:80px;
+background:#ff4aa2;
+color:white;
+border:none;
+}
+</style>
+
+</head>
+
+<body>
+
+<div id="login">
+<h2>Введите ник</h2>
+<input id="name" placeholder="ник">
+<button onclick="join()">Войти</button>
+</div>
+
+<div id="chat">
+<div id="messages"></div>
+
+<div class="bottom">
+<input id="text" placeholder="сообщение">
+<button onclick="send()">➤</button>
+</div>
+</div>
+
+<script>
+let socket;
+let username;
+
+function join(){
+
+username=document.getElementById("name").value;
+if(!username) return;
+
+document.getElementById("login").style.display="none";
+document.getElementById("chat").style.display="flex";
+
+socket=new WebSocket("wss://chat-server-rd5j.onrender.com");
+
+socket.onmessage=function(e){
+let data=JSON.parse(e.data);
+
+let div=document.createElement("div");
+div.className="msg";
+div.innerHTML="<b>"+data.name+":</b> "+data.text;
+
+document.getElementById("messages").appendChild(div);
+}
+
+}
+
+function send(){
+let text=document.getElementById("text").value;
+if(!text) return;
+
+socket.send(JSON.stringify({
+name:username,
+text:text
+}));
+
+document.getElementById("text").value="";
+}
+</script>
+
+</body>
+</html>
