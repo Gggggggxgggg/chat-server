@@ -10,7 +10,7 @@ const users = new Map();
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
-// -------------------- DATABASE --------------------
+// ---------------- DATABASE ----------------
 
 if (!fs.existsSync("./database")) {
     fs.mkdirSync("./database");
@@ -18,7 +18,16 @@ if (!fs.existsSync("./database")) {
 
 const db = new sqlite3.Database("./database/chat.db");
 
-// таблица сообщений
+// USERS TABLE
+db.run(`
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    password TEXT
+)
+`);
+
+// MESSAGES TABLE
 db.run(`
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,23 +42,7 @@ CREATE TABLE IF NOT EXISTS messages (
 )
 `);
 
-// -------------------- HELPERS --------------------
-
-function saveMessage(msg, user) {
-    db.run(`
-        INSERT INTO messages (room, name, type, text, fileType, fileName, data, time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-        user.room,
-        user.name,
-        msg.type,
-        msg.text || "",
-        msg.fileType || "",
-        msg.fileName || "",
-        msg.data || "",
-        Date.now()
-    ]);
-}
+// ---------------- HELPERS ----------------
 
 function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
@@ -68,7 +61,7 @@ function sendOnline(room) {
     const list = [];
 
     users.forEach(u => {
-        if (u.room === room) {
+        if (u.room === room && u.auth) {
             list.push({
                 id: u.id,
                 name: u.name,
@@ -83,20 +76,35 @@ function sendOnline(room) {
     });
 }
 
-// -------------------- SERVER --------------------
+// SAVE MESSAGE
+function saveMessage(room, name, data) {
+    db.run(`
+        INSERT INTO messages (room, name, type, text, fileType, fileName, data, time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+        room,
+        name,
+        data.type,
+        data.text || "",
+        data.fileType || "",
+        data.fileName || "",
+        data.data || "",
+        Date.now()
+    ]);
+}
+
+// ---------------- SERVER ----------------
 
 server.on("connection", (ws) => {
 
     const user = {
         id: crypto.randomUUID(),
-        name: "Guest_" + Math.floor(Math.random() * 9999),
+        name: null,
         room: "global",
-        avatar: DEFAULT_AVATAR
+        auth: false
     };
 
     users.set(ws, user);
-
-    sendOnline(user.room);
 
     ws.on("message", (raw) => {
 
@@ -107,15 +115,89 @@ server.on("connection", (ws) => {
             return;
         }
 
-        const user = users.get(ws);
-        if (!user) return;
+        const u = users.get(ws);
+        if (!u) return;
 
-        // ---------------- JOIN ----------------
+        // ---------------- REGISTER ----------------
+        if (msg.type === "register") {
+
+            const { username, password } = msg;
+
+            db.get(
+                "SELECT * FROM users WHERE name = ?",
+                [username],
+                (err, row) => {
+
+                    if (row) {
+                        ws.send(JSON.stringify({
+                            type: "error",
+                            text: "User already exists"
+                        }));
+                        return;
+                    }
+
+                    db.run(
+                        "INSERT INTO users (name, password) VALUES (?, ?)",
+                        [username, password]
+                    );
+
+                    u.name = username;
+                    u.auth = true;
+
+                    ws.send(JSON.stringify({
+                        type: "login_ok",
+                        name: username
+                    }));
+
+                    sendOnline(u.room);
+                }
+            );
+
+            return;
+        }
+
+        // ---------------- LOGIN ----------------
+        if (msg.type === "login") {
+
+            const { username, password } = msg;
+
+            db.get(
+                "SELECT * FROM users WHERE name = ? AND password = ?",
+                [username, password],
+                (err, row) => {
+
+                    if (!row) {
+                        ws.send(JSON.stringify({
+                            type: "error",
+                            text: "Wrong login or password"
+                        }));
+                        return;
+                    }
+
+                    u.name = username;
+                    u.auth = true;
+
+                    ws.send(JSON.stringify({
+                        type: "login_ok",
+                        name: username
+                    }));
+
+                    sendOnline(u.room);
+                }
+            );
+
+            return;
+        }
+
+        // ---------------- BLOCK IF NOT AUTH ----------------
+        if (!u.auth) return;
+
+        // ---------------- JOIN ROOM ----------------
         if (msg.type === "join") {
-            user.room = msg.room;
-            users.set(ws, user);
+            u.room = msg.room;
+            users.set(ws, u);
 
-            sendOnline(user.room);
+            sendOnline(u.room);
             return;
         }
 
@@ -124,22 +206,13 @@ server.on("connection", (ws) => {
 
             const data = {
                 type: "text",
-                name: user.name,
+                name: u.name,
                 avatar: DEFAULT_AVATAR,
                 text: msg.text
             };
 
-            broadcastRoom(user.room, data);
-            saveMessage(data, user);
-        }
-
-        // ---------------- NAME ----------------
-        if (msg.type === "name") {
-            user.name = msg.name || user.name;
-            users.set(ws, user);
-
-            sendOnline(user.room);
-            return;
+            broadcastRoom(u.room, data);
+            saveMessage(u.room, u.name, data);
         }
 
         // ---------------- FILE ----------------
@@ -147,31 +220,39 @@ server.on("connection", (ws) => {
 
             const data = {
                 type: "file",
-                name: user.name,
+                name: u.name,
                 avatar: DEFAULT_AVATAR,
                 fileType: msg.fileType,
                 fileName: msg.fileName,
                 data: msg.data
             };
 
-            broadcastRoom(user.room, data);
-            saveMessage(data, user);
+            broadcastRoom(u.room, data);
+            saveMessage(u.room, u.name, data);
         }
 
         // ---------------- TYPING ----------------
         if (msg.type === "typing") {
-            broadcastRoom(user.room, {
+            broadcastRoom(u.room, {
                 type: "typing",
-                name: user.name
+                name: u.name
             });
+        }
+
+        // ---------------- CHANGE NAME ----------------
+        if (msg.type === "name") {
+            u.name = msg.name;
+            users.set(ws, u);
+
+            sendOnline(u.room);
         }
     });
 
     ws.on("close", () => {
-        const user = users.get(ws);
+        const u = users.get(ws);
         users.delete(ws);
 
-        if (user) sendOnline(user.room);
+        if (u) sendOnline(u.room);
     });
 });
 
