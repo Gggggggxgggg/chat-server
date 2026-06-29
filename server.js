@@ -1,169 +1,202 @@
-let ws;
-let room = "global";
-let chats = {};
+const WebSocket = require("ws");
+const crypto = require("crypto");
+const sqlite3 = require("sqlite3").verbose();
+
+const PORT = process.env.PORT || 8080;
+const server = new WebSocket.Server({ port: PORT });
+
+// ================= DB =================
+const db = new sqlite3.Database("./database.db");
+
+db.serialize(() => {
+db.run(`
+CREATE TABLE IF NOT EXISTS users (
+id TEXT PRIMARY KEY,
+name TEXT,
+password TEXT,
+avatar TEXT
+)
+`);
+
+db.run(`
+CREATE TABLE IF NOT EXISTS messages (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+room TEXT,
+fromUser TEXT,
+toUser TEXT,
+text TEXT,
+type TEXT,
+time INTEGER
+)
+`);
+});
+
+// ================= USERS =================
+const clients = new Map();
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
-function el(id){ return document.getElementById(id); }
-
-function connect(){
-ws = new WebSocket("wss://chat-server-1-7wdv.onrender.com");
-
-ws.onmessage = (e) => {
-const m = JSON.parse(e.data);
-
-if(m.type === "login_ok"){
-el("auth").style.display = "none";
+// ================= BROADCAST ROOM =================
+function sendToRoom(room, data){
+server.clients.forEach(c=>{
+const u = clients.get(c);
+if(c.readyState === WebSocket.OPEN && u?.room === room){
+c.send(JSON.stringify(data));
+}
+});
 }
 
-if(m.type === "error"){
-el("err").innerText = m.text;
+// ================= ONLINE =================
+function sendOnline(room){
+const list = [];
+
+clients.forEach(u=>{
+if(u.room === room){
+list.push({
+id:u.id,
+name:u.name,
+avatar:u.avatar
+});
+}
+});
+
+sendToRoom(room,{
+type:"online",
+users:list
+});
 }
 
-if(m.type === "online"){
-renderOnline(m.users);
-}
+// ================= CONNECTION =================
+server.on("connection",(ws)=>{
+const id = crypto.randomUUID();
 
-if(m.type === "text" || m.type === "file"){
-if(!chats[room]) chats[room] = [];
-chats[room].push(m);
-renderMessages();
-}
-
-if(m.type === "typing"){
-showTyping(m.name);
-}
+const user = {
+id,
+name:"Guest_"+id.slice(0,5),
+room:"global",
+avatar:DEFAULT_AVATAR
 };
+
+clients.set(ws,user);
+
+sendOnline(user.room);
+
+ws.on("message",(raw)=>{
+let msg;
+try{ msg = JSON.parse(raw.toString()); }catch{return;}
+
+const u = clients.get(ws);
+if(!u) return;
+
+// ================= REGISTER =================
+if(msg.type==="register"){
+db.get("SELECT * FROM users WHERE name=?",[msg.username],(err,row)=>{
+if(row){
+ws.send(JSON.stringify({type:"error",text:"User exists"}));
+return;
 }
 
-function login(){
-ws.send(JSON.stringify({
-type:"login",
-username:el("user").value,
-password:el("pass").value
-}));
+const id = crypto.randomUUID();
+
+db.run(
+"INSERT INTO users VALUES (?,?,?,?)",
+[id,msg.username,msg.password,DEFAULT_AVATAR]
+);
+
+ws.send(JSON.stringify({type:"login_ok"}));
+});
 }
 
-function register(){
-ws.send(JSON.stringify({
-type:"register",
-username:el("user").value,
-password:el("pass").value
-}));
+// ================= LOGIN =================
+if(msg.type==="login"){
+db.get(
+"SELECT * FROM users WHERE name=? AND password=?",
+[msg.username,msg.password],
+(err,row)=>{
+
+if(!row){
+ws.send(JSON.stringify({type:"error",text:"Wrong login"}));
+return;
 }
 
-function toggleSettings(){
-const s = el("settings");
-s.style.display = (s.style.display === "flex") ? "none" : "flex";
+u.name = row.name;
+u.avatar = row.avatar;
+clients.set(ws,u);
+
+ws.send(JSON.stringify({type:"login_ok"}));
+sendOnline(u.room);
+});
 }
 
-function saveProfile(){
-ws.send(JSON.stringify({
-type:"update_profile",
-avatar:el("avatarInput").value,
-birthday:el("birthInput").value
-}));
-toggleSettings();
+// ================= JOIN =================
+if(msg.type==="join"){
+u.room = msg.room;
+clients.set(ws,u);
+sendOnline(u.room);
 }
 
-function join(r){
-room = r;
-ws.send(JSON.stringify({type:"join", room:r}));
-
-if(!chats[room]) chats[room] = [];
-renderMessages();
-}
-
-function sendMessage(){
-const input = el("msg");
-if(!ws || !input.value.trim()) return;
-
-ws.send(JSON.stringify({
+// ================= TEXT =================
+if(msg.type==="text"){
+const data = {
 type:"text",
-text: input.value
-}));
+name:u.name,
+avatar:u.avatar,
+text:msg.text,
+room:u.room
+};
 
-input.value = "";
+db.run(
+"INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
+[u.room,u.name,msg.text,"text",Date.now()]
+);
+
+sendToRoom(u.room,data);
 }
 
-function renderOnline(users){
-const box = el("online");
-box.innerHTML = "";
-
-users.forEach(u=>{
-const d = document.createElement("div");
-d.className = "user";
-
-d.innerHTML = `
-<img src="${u.avatar || DEFAULT_AVATAR}">
-<div>${u.name}</div>
-`;
-
-box.appendChild(d);
-});
-}
-
-function renderMessages(){
-const box = el("messages");
-box.innerHTML = "";
-
-if(!chats[room]) chats[room] = [];
-
-chats[room].forEach(m=>{
-const wrap = document.createElement("div");
-wrap.className = "msg";
-
-wrap.innerHTML = `
-<img class="avatar" src="${m.avatar || DEFAULT_AVATAR}">
-<div class="bubble">
-<b>${m.name}</b><br>
-${m.text || ""}
-</div>
-`;
-
-box.appendChild(wrap);
-});
-
-box.scrollTop = box.scrollHeight;
-}
-
-el("fileInput").onchange = (e)=>{
-const file = e.target.files[0];
-if(!file) return;
-
-const reader = new FileReader();
-
-reader.onload = () => {
-ws.send(JSON.stringify({
+// ================= FILE =================
+if(msg.type==="file"){
+sendToRoom(u.room,{
 type:"file",
-fileName:file.name,
-fileType:file.type,
-data:reader.result
+name:u.name,
+avatar:u.avatar,
+fileName:msg.fileName,
+fileType:msg.fileType,
+data:msg.data
+});
+}
+
+// ================= DM =================
+if(msg.type==="dm"){
+const targetId = msg.to;
+
+server.clients.forEach(c=>{
+const t = clients.get(c);
+
+if(t && t.id === targetId){
+c.send(JSON.stringify({
+type:"dm",
+from:u.id,
+name:u.name,
+text:msg.text
 }));
-};
-
-reader.readAsDataURL(file);
-};
-
-function showTyping(name){
-el("typing").innerText = name + " typing...";
-
-setTimeout(()=>{
-el("typing").innerText = "";
-}, 1000);
 }
-
-function filterUsers(){
-const q = el("search").value.toLowerCase();
-document.querySelectorAll(".user").forEach(u=>{
-u.style.display = u.innerText.toLowerCase().includes(q) ? "flex" : "none";
 });
 }
 
-el("sendBtn").onclick = sendMessage;
+// ================= TYPING =================
+if(msg.type==="typing"){
+sendToRoom(u.room,{
+type:"typing",
+name:u.name
+});
+}
 
-el("msg").addEventListener("keydown",(e)=>{
-if(e.key === "Enter") sendMessage();
 });
 
-connect();
+// ================= CLOSE =================
+ws.on("close",()=>{
+clients.delete(ws);
+});
+});
+
+console.log("Server running on port " + PORT);
