@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 8080;
 const server = new WebSocket.Server({ port: PORT });
 
-const users = new Map(); // ws -> user
+const users = new Map();
 
 function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
@@ -23,11 +23,13 @@ function sendOnline(room) {
     const list = [];
 
     users.forEach(u => {
-        if (u.room === room) list.push({
-            id: u.id,
-            name: u.name,
-            avatar: u.avatar
-        });
+        if (u.room === room) {
+            list.push({
+                id: u.id,
+                name: u.name,
+                avatar: u.avatar
+            });
+        }
     });
 
     broadcastRoom(room, {
@@ -48,12 +50,6 @@ server.on("connection", (ws) => {
 
     users.set(ws, user);
 
-    ws.send(JSON.stringify({
-        type: "system",
-        text: "connected",
-        user
-    }));
-
     sendOnline(user.room);
 
     ws.on("message", (raw) => {
@@ -68,56 +64,56 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         if (!user) return;
 
-        // ================= ROOM =================
+        // ROOM SWITCH
         if (msg.type === "join") {
             user.room = msg.room;
             users.set(ws, user);
-
             sendOnline(user.room);
-
-            broadcastRoom(user.room, {
-                type: "system",
-                text: user.name + " joined " + user.room
-            });
+            return;
         }
 
-        // ================= TEXT =================
+        // TEXT
         if (msg.type === "text") {
             broadcastRoom(user.room, {
                 type: "text",
                 name: user.name,
                 avatar: user.avatar,
-                text: msg.text,
-                time: Date.now()
+                text: msg.text
             });
         }
 
-        // ================= FILE =================
+        // FILE (image/video)
         if (msg.type === "file") {
             broadcastRoom(user.room, {
                 type: "file",
                 name: user.name,
                 avatar: user.avatar,
                 fileType: msg.fileType,
-                fileName: msg.fileName,
-                data: msg.data
+                data: msg.data,
+                fileName: msg.fileName
             });
         }
 
-        // ================= TYPING =================
+        // AVATAR
+        if (msg.type === "avatar") {
+            user.avatar = msg.data;
+            users.set(ws, user);
+            sendOnline(user.room);
+        }
+
+        // NAME
+        if (msg.type === "name") {
+            user.name = msg.name;
+            users.set(ws, user);
+            sendOnline(user.room);
+        }
+
+        // TYPING
         if (msg.type === "typing") {
             broadcastRoom(user.room, {
                 type: "typing",
                 name: user.name
             });
-        }
-
-        // ================= NAME =================
-        if (msg.type === "name") {
-            user.name = msg.name;
-            users.set(ws, user);
-
-            sendOnline(user.room);
         }
     });
 
@@ -125,10 +121,8 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         users.delete(ws);
 
-        if (user) {
-            sendOnline(user.room);
-        }
+        if (user) sendOnline(user.room);
     });
 });
 
-console.log("🚀 Server running on " + PORT);
+console.log("🚀 Server running on port " + PORT);
