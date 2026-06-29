@@ -4,15 +4,35 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 8080;
 const server = new WebSocket.Server({ port: PORT });
 
-const users = new Map();
+const users = new Map(); // ws -> user
 
-function broadcast(data) {
+function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
 
     server.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
-            client.send(msg);
+            const u = users.get(client);
+            if (u && u.room === room) {
+                client.send(msg);
+            }
         }
+    });
+}
+
+function sendOnline(room) {
+    const list = [];
+
+    users.forEach(u => {
+        if (u.room === room) list.push({
+            id: u.id,
+            name: u.name,
+            avatar: u.avatar
+        });
+    });
+
+    broadcastRoom(room, {
+        type: "online",
+        users: list
     });
 }
 
@@ -21,18 +41,20 @@ server.on("connection", (ws) => {
 
     const user = {
         id,
-        name: "Guest_" + id.slice(0, 5)
+        name: "Guest_" + id.slice(0, 5),
+        room: "global",
+        avatar: "https://api.dicebear.com/7.x/bottts/svg?seed=" + id
     };
 
     users.set(ws, user);
 
-    console.log("User connected:", user.name);
-
     ws.send(JSON.stringify({
         type: "system",
         text: "connected",
-        name: user.name
+        user
     }));
+
+    sendOnline(user.room);
 
     ws.on("message", (raw) => {
         let msg;
@@ -46,38 +68,56 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         if (!user) return;
 
+        // ================= ROOM =================
+        if (msg.type === "join") {
+            user.room = msg.room;
+            users.set(ws, user);
+
+            sendOnline(user.room);
+
+            broadcastRoom(user.room, {
+                type: "system",
+                text: user.name + " joined " + user.room
+            });
+        }
+
         // ================= TEXT =================
         if (msg.type === "text") {
-            broadcast({
+            broadcastRoom(user.room, {
                 type: "text",
                 name: user.name,
+                avatar: user.avatar,
                 text: msg.text,
                 time: Date.now()
             });
         }
 
         // ================= FILE =================
-        else if (msg.type === "file") {
-            broadcast({
+        if (msg.type === "file") {
+            broadcastRoom(user.room, {
                 type: "file",
                 name: user.name,
-                fileName: msg.fileName,
+                avatar: user.avatar,
                 fileType: msg.fileType,
-                data: msg.data,
-                time: Date.now()
+                fileName: msg.fileName,
+                data: msg.data
+            });
+        }
+
+        // ================= TYPING =================
+        if (msg.type === "typing") {
+            broadcastRoom(user.room, {
+                type: "typing",
+                name: user.name
             });
         }
 
         // ================= NAME =================
-        else if (msg.type === "name") {
-            user.name = msg.name || user.name;
+        if (msg.type === "name") {
+            user.name = msg.name;
             users.set(ws, user);
 
-            ws.send(JSON.stringify({
-                type: "system",
-                text: "name updated",
-                name: user.name
-            }));
+            sendOnline(user.room);
         }
     });
 
@@ -85,12 +125,10 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         users.delete(ws);
 
-        broadcast({
-            type: "system",
-            text: "user disconnected",
-            name: user?.name
-        });
+        if (user) {
+            sendOnline(user.room);
+        }
     });
 });
 
-console.log("🚀 Server running on port " + PORT);
+console.log("🚀 Server running on " + PORT);
