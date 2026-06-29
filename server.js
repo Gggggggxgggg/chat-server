@@ -1,202 +1,238 @@
+const express = require("express");
+const http = require("http");
 const WebSocket = require("ws");
-const crypto = require("crypto");
 const sqlite3 = require("sqlite3").verbose();
+const bcrypt = require("bcrypt");
+const cors = require("cors");
 
-const PORT = process.env.PORT || 8080;
-const server = new WebSocket.Server({ port: PORT });
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const PORT = 8080;
 
 // ================= DB =================
-const db = new sqlite3.Database("./database.db");
+const db = new sqlite3.Database("./chat.db");
 
-db.serialize(() => {
 db.run(`
 CREATE TABLE IF NOT EXISTS users (
-id TEXT PRIMARY KEY,
-name TEXT,
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+username TEXT UNIQUE,
 password TEXT,
-avatar TEXT
-)
+avatar TEXT DEFAULT '',
+birthday TEXT DEFAULT ''
+);
 `);
 
 db.run(`
 CREATE TABLE IF NOT EXISTS messages (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 room TEXT,
-fromUser TEXT,
-toUser TEXT,
+sender TEXT,
 text TEXT,
 type TEXT,
-time INTEGER
-)
+data TEXT,
+time DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 `);
-});
 
-// ================= USERS =================
-const clients = new Map();
-
+// ================= STATE =================
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
-// ================= BROADCAST ROOM =================
-function sendToRoom(room, data){
-server.clients.forEach(c=>{
-const u = clients.get(c);
-if(c.readyState === WebSocket.OPEN && u?.room === room){
-c.send(JSON.stringify(data));
+let clients = new Map(); 
+// ws -> {id, username, avatar, birthday, room}
+
+// ================= HELPERS =================
+function broadcastRoom(room, data, exceptWs = null) {
+    wss.clients.forEach(client => {
+        const u = clients.get(client);
+        if (!u) return;
+
+        if (client.readyState === WebSocket.OPEN && u.room === room) {
+            if (client !== exceptWs) {
+                client.send(JSON.stringify(data));
+            }
+        }
+    });
 }
+
+function sendOnline(room) {
+    const list = [];
+
+    clients.forEach(u => {
+        if (u.room === room) {
+            list.push({
+                id: u.id,
+                name: u.username,
+                avatar: u.avatar || DEFAULT_AVATAR,
+                birthday: u.birthday || ""
+            });
+        }
+    });
+
+    broadcastRoom(room, {
+        type: "online",
+        users: list
+    });
+}
+
+// ================= WS =================
+wss.on("connection", (ws) => {
+
+    ws.room = "global";
+
+    ws.on("message", (raw) => {
+        let data;
+        try { data = JSON.parse(raw.toString()); } catch { return; }
+
+        const user = clients.get(ws);
+
+        // ================= REGISTER =================
+        if (data.type === "register") {
+            const hash = bcrypt.hashSync(data.password, 10);
+
+            db.run(
+                "INSERT INTO users(username,password) VALUES(?,?)",
+                [data.username, hash],
+                (err) => {
+                    if (err) {
+                        ws.send(JSON.stringify({
+                            type: "error",
+                            text: "User already exists"
+                        }));
+                        return;
+                    }
+
+                    ws.send(JSON.stringify({ type: "login_ok" }));
+                }
+            );
+        }
+
+        // ================= LOGIN =================
+        if (data.type === "login") {
+            db.get(
+                "SELECT * FROM users WHERE username=?",
+                [data.username],
+                (err, row) => {
+
+                    if (!row) {
+                        ws.send(JSON.stringify({ type: "error", text: "User not found" }));
+                        return;
+                    }
+
+                    if (!bcrypt.compareSync(data.password, row.password)) {
+                        ws.send(JSON.stringify({ type: "error", text: "Wrong password" }));
+                        return;
+                    }
+
+                    const u = {
+                        id: row.id,
+                        username: row.username,
+                        avatar: row.avatar || DEFAULT_AVATAR,
+                        birthday: row.birthday || "",
+                        room: "global"
+                    };
+
+                    clients.set(ws, u);
+
+                    ws.send(JSON.stringify({
+                        type: "login_ok",
+                        user: u
+                    }));
+
+                    sendOnline(u.room);
+                }
+            );
+        }
+
+        // ================= JOIN ROOM =================
+        if (data.type === "join") {
+            const u = clients.get(ws);
+            if (!u) return;
+
+            u.room = data.room;
+            ws.room = data.room;
+
+            clients.set(ws, u);
+
+            sendOnline(data.room);
+        }
+
+        // ================= UPDATE PROFILE =================
+        if (data.type === "update_profile") {
+            const u = clients.get(ws);
+            if (!u) return;
+
+            u.avatar = data.avatar || u.avatar;
+            u.birthday = data.birthday || u.birthday;
+
+            clients.set(ws, u);
+
+            db.run(
+                "UPDATE users SET avatar=?, birthday=? WHERE id=?",
+                [u.avatar, u.birthday, u.id]
+            );
+
+            sendOnline(u.room);
+        }
+
+        // ================= TEXT =================
+        if (data.type === "text") {
+            const u = clients.get(ws);
+            if (!u) return;
+
+            const msg = {
+                type: "text",
+                name: u.username,
+                text: data.text,
+                avatar: u.avatar
+            };
+
+            db.run(
+                "INSERT INTO messages(room,sender,text,type,data) VALUES(?,?,?,?,?)",
+                [u.room, u.username, data.text, "text", ""]
+            );
+
+            broadcastRoom(u.room, msg);
+        }
+
+        // ================= FILE =================
+        if (data.type === "file") {
+            const u = clients.get(ws);
+            if (!u) return;
+
+            const msg = {
+                type: "file",
+                name: u.username,
+                avatar: u.avatar,
+                fileName: data.fileName,
+                fileType: data.fileType,
+                data: data.data
+            };
+
+            broadcastRoom(u.room, msg);
+        }
+
+        // ================= TYPING =================
+        if (data.type === "typing") {
+            const u = clients.get(ws);
+            if (!u) return;
+
+            broadcastRoom(u.room, {
+                type: "typing",
+                name: u.username
+            }, ws);
+        }
+    });
+
+    // ================= DISCONNECT =================
+    ws.on("close", () => {
+        clients.delete(ws);
+    });
 });
-}
 
-// ================= ONLINE =================
-function sendOnline(room){
-const list = [];
-
-clients.forEach(u=>{
-if(u.room === room){
-list.push({
-id:u.id,
-name:u.name,
-avatar:u.avatar
+server.listen(PORT, () => {
+    console.log("Server running on port " + PORT);
 });
-}
-});
-
-sendToRoom(room,{
-type:"online",
-users:list
-});
-}
-
-// ================= CONNECTION =================
-server.on("connection",(ws)=>{
-const id = crypto.randomUUID();
-
-const user = {
-id,
-name:"Guest_"+id.slice(0,5),
-room:"global",
-avatar:DEFAULT_AVATAR
-};
-
-clients.set(ws,user);
-
-sendOnline(user.room);
-
-ws.on("message",(raw)=>{
-let msg;
-try{ msg = JSON.parse(raw.toString()); }catch{return;}
-
-const u = clients.get(ws);
-if(!u) return;
-
-// ================= REGISTER =================
-if(msg.type==="register"){
-db.get("SELECT * FROM users WHERE name=?",[msg.username],(err,row)=>{
-if(row){
-ws.send(JSON.stringify({type:"error",text:"User exists"}));
-return;
-}
-
-const id = crypto.randomUUID();
-
-db.run(
-"INSERT INTO users VALUES (?,?,?,?)",
-[id,msg.username,msg.password,DEFAULT_AVATAR]
-);
-
-ws.send(JSON.stringify({type:"login_ok"}));
-});
-}
-
-// ================= LOGIN =================
-if(msg.type==="login"){
-db.get(
-"SELECT * FROM users WHERE name=? AND password=?",
-[msg.username,msg.password],
-(err,row)=>{
-
-if(!row){
-ws.send(JSON.stringify({type:"error",text:"Wrong login"}));
-return;
-}
-
-u.name = row.name;
-u.avatar = row.avatar;
-clients.set(ws,u);
-
-ws.send(JSON.stringify({type:"login_ok"}));
-sendOnline(u.room);
-});
-}
-
-// ================= JOIN =================
-if(msg.type==="join"){
-u.room = msg.room;
-clients.set(ws,u);
-sendOnline(u.room);
-}
-
-// ================= TEXT =================
-if(msg.type==="text"){
-const data = {
-type:"text",
-name:u.name,
-avatar:u.avatar,
-text:msg.text,
-room:u.room
-};
-
-db.run(
-"INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
-[u.room,u.name,msg.text,"text",Date.now()]
-);
-
-sendToRoom(u.room,data);
-}
-
-// ================= FILE =================
-if(msg.type==="file"){
-sendToRoom(u.room,{
-type:"file",
-name:u.name,
-avatar:u.avatar,
-fileName:msg.fileName,
-fileType:msg.fileType,
-data:msg.data
-});
-}
-
-// ================= DM =================
-if(msg.type==="dm"){
-const targetId = msg.to;
-
-server.clients.forEach(c=>{
-const t = clients.get(c);
-
-if(t && t.id === targetId){
-c.send(JSON.stringify({
-type:"dm",
-from:u.id,
-name:u.name,
-text:msg.text
-}));
-}
-});
-}
-
-// ================= TYPING =================
-if(msg.type==="typing"){
-sendToRoom(u.room,{
-type:"typing",
-name:u.name
-});
-}
-
-});
-
-// ================= CLOSE =================
-ws.on("close",()=>{
-clients.delete(ws);
-});
-});
-
-console.log("Server running on port " + PORT);
