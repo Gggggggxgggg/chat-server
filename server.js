@@ -4,11 +4,11 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 8080;
 const server = new WebSocket.Server({ port: PORT });
 
-// храним пользователей
+// ws -> user
 const users = new Map();
 
-function broadcast(data) {
-    const msg = JSON.stringify(data);
+function broadcast(obj) {
+    const msg = JSON.stringify(obj);
 
     server.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
@@ -19,32 +19,37 @@ function broadcast(data) {
 
 server.on("connection", (ws) => {
     const id = crypto.randomUUID();
-    users.set(ws, { id, name: "Guest_" + id.slice(0, 5) });
+
+    const user = {
+        id,
+        name: "Guest_" + id.slice(0, 5)
+    };
+
+    users.set(ws, user);
 
     console.log("User connected:", id);
 
-    // приветствие
+    // отправка инфы клиенту
     ws.send(JSON.stringify({
         type: "system",
-        text: "Connected to server",
-        id
+        text: "connected",
+        id,
+        name: user.name
     }));
 
     ws.on("message", (raw) => {
         let msg;
 
-        // защита от битых данных
         try {
             msg = JSON.parse(raw.toString());
-        } catch (e) {
+        } catch {
             return;
         }
 
         const user = users.get(ws);
+        if (!user) return;
 
-        // ========================
-        // TEXT MESSAGE
-        // ========================
+        // ================= TEXT =================
         if (msg.type === "text") {
             broadcast({
                 type: "text",
@@ -55,45 +60,44 @@ server.on("connection", (ws) => {
             });
         }
 
-        // ========================
-        // IMAGE / VIDEO / FILE
-        // ========================
-        else if (
-            msg.type === "image" ||
-            msg.type === "video" ||
-            msg.type === "file"
-        ) {
+        // ================= FILE =================
+        else if (msg.type === "file") {
             broadcast({
-                type: msg.type,
+                type: "file",
                 id: user.id,
                 name: user.name,
-                fileName: msg.fileName || "unknown",
-                data: msg.data, // base64
+                fileName: msg.fileName || "file",
+                fileType: msg.fileType || "unknown",
+                data: msg.data,
                 time: Date.now()
             });
         }
 
-        // ========================
-        // CHANGE NAME
-        // ========================
+        // ================= NAME =================
         else if (msg.type === "name") {
-            user.name = msg.name;
+            user.name = msg.name || user.name;
+
+            users.set(ws, user);
 
             ws.send(JSON.stringify({
                 type: "system",
-                text: "Name changed to " + msg.name
+                text: "name updated",
+                name: user.name
             }));
         }
     });
 
     ws.on("close", () => {
+        const user = users.get(ws);
+
         users.delete(ws);
 
         broadcast({
             type: "system",
-            text: "User disconnected"
+            text: "user disconnected",
+            name: user?.name
         });
     });
 });
 
-console.log("🚀 Chat Server running on port " + PORT);
+console.log("🚀 Server running on port " + PORT);
