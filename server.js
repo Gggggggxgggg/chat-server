@@ -22,173 +22,150 @@ birthday TEXT DEFAULT ''
 );
 `);
 
-let clients = new Map();
+let clients = new Map(); // ws -> user
 
-/* ---------------- ROOM BROADCAST ---------------- */
-
-function broadcastRoom(room, data, except = null) {
-wss.clients.forEach(c => {
-if (c.readyState === 1 && c.room === room && c !== except) {
-c.send(JSON.stringify(data));
+function broadcastRoom(room, data, exceptWs = null) {
+  wss.clients.forEach(c => {
+    const u = clients.get(c);
+    if (c.readyState === 1 && u?.room === room && c !== exceptWs) {
+      c.send(JSON.stringify(data));
+    }
+  });
 }
-});
-}
-
-/* ---------------- ONLINE ---------------- */
 
 function sendOnline(room) {
-let users = [];
+  const list = [];
 
-wss.clients.forEach(c => {
-if (c.room === room && c.user) {
-users.push({
-id: c.user.id,
-name: c.user.username,
-avatar: c.user.avatar || DEFAULT_AVATAR
-});
+  clients.forEach(u => {
+    if (u.room === room) {
+      list.push({
+        id: u.id,
+        name: u.username,
+        avatar: u.avatar
+      });
+    }
+  });
+
+  broadcastRoom(room, { type: "online", users: list });
 }
-});
-
-broadcastRoom(room, {
-type: "online",
-users
-});
-}
-
-/* ---------------- CONNECTION ---------------- */
 
 wss.on("connection", (ws) => {
 
-ws.room = "global";
-ws.user = null;
+  ws.user = null;
 
-/* ---------------- MESSAGE ---------------- */
+  ws.on("message", (raw) => {
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
 
-ws.on("message", (raw) => {
-let data;
-try { data = JSON.parse(raw); } catch { return; }
+    // REGISTER
+    if (data.type === "register") {
+      const hash = bcrypt.hashSync(data.password, 10);
 
-/* ---------------- REGISTER ---------------- */
+      db.run(
+        "INSERT INTO users(username,password,avatar) VALUES(?,?,?)",
+        [data.username, hash, DEFAULT_AVATAR],
+        (err) => {
+          if (err) {
+            ws.send(JSON.stringify({ type: "error", text: "User exists" }));
+            return;
+          }
+          ws.send(JSON.stringify({ type: "login_ok" }));
+        }
+      );
+    }
 
-if (data.type === "register") {
-let hash = bcrypt.hashSync(data.password, 10);
+    // LOGIN
+    if (data.type === "login") {
+      db.get(
+        "SELECT * FROM users WHERE username=?",
+        [data.username],
+        (err, user) => {
 
-db.run(
-"INSERT INTO users(username,password,avatar) VALUES(?,?,?)",
-[data.username, hash, DEFAULT_AVATAR],
-(err) => {
-if (err) {
-ws.send(JSON.stringify({ type: "error", text: "User exists" }));
-return;
-}
+          if (!user) {
+            ws.send(JSON.stringify({ type: "error", text: "No user" }));
+            return;
+          }
 
-ws.send(JSON.stringify({ type: "login_ok" }));
-}
-);
-}
+          if (!bcrypt.compareSync(data.password, user.password)) {
+            ws.send(JSON.stringify({ type: "error", text: "Wrong password" }));
+            return;
+          }
 
-/* ---------------- LOGIN ---------------- */
+          ws.user = {
+            id: user.id,
+            username: user.username,
+            avatar: user.avatar || DEFAULT_AVATAR,
+            room: "global"
+          };
 
-if (data.type === "login") {
-db.get(
-"SELECT * FROM users WHERE username=?",
-[data.username],
-(err, user) => {
+          clients.set(ws, ws.user);
 
-if (!user) {
-ws.send(JSON.stringify({ type: "error", text: "No user" }));
-return;
-}
+          ws.send(JSON.stringify({
+            type: "login_ok",
+            user: ws.user
+          }));
 
-if (!bcrypt.compareSync(data.password, user.password)) {
-ws.send(JSON.stringify({ type: "error", text: "Wrong password" }));
-return;
-}
+          sendOnline("global");
+        }
+      );
+    }
 
-ws.user = {
-...user,
-avatar: user.avatar || DEFAULT_AVATAR
-};
+    // JOIN
+    if (data.type === "join") {
+      const u = clients.get(ws);
+      if (!u) return;
 
-ws.send(JSON.stringify({
-type: "login_ok",
-user: ws.user
-}));
-}
-);
-}
+      u.room = data.room;
+      clients.set(ws, u);
 
-/* ---------------- JOIN ---------------- */
+      sendOnline(data.room);
+    }
 
-if (data.type === "join") {
-ws.room = data.room || "global";
-sendOnline(ws.room);
-}
+    // TEXT
+    if (data.type === "text") {
+      const u = clients.get(ws);
+      if (!u) return;
 
-/* ---------------- PROFILE UPDATE ---------------- */
+      broadcastRoom(u.room, {
+        type: "text",
+        name: u.username,
+        avatar: u.avatar,
+        text: data.text
+      });
+    }
 
-if (data.type === "update_profile") {
-if (!ws.user) return;
+    // FILE
+    if (data.type === "file") {
+      const u = clients.get(ws);
+      if (!u) return;
 
-const avatar = data.avatar || DEFAULT_AVATAR;
+      broadcastRoom(u.room, {
+        type: "file",
+        name: u.username,
+        avatar: u.avatar,
+        fileName: data.fileName,
+        fileType: data.fileType,
+        data: data.data
+      });
+    }
 
-db.run(
-"UPDATE users SET avatar=?, birthday=? WHERE id=?",
-[avatar, data.birthday || "", ws.user.id]
-);
+    // TYPING
+    if (data.type === "typing") {
+      const u = clients.get(ws);
+      if (!u) return;
 
-ws.user.avatar = avatar;
-ws.user.birthday = data.birthday;
-}
+      broadcastRoom(u.room, {
+        type: "typing",
+        name: u.username
+      }, ws);
+    }
+  });
 
-/* ---------------- TEXT ---------------- */
-
-if (data.type === "text") {
-if (!ws.user) return;
-
-broadcastRoom(ws.room, {
-type: "text",
-name: ws.user.username,
-text: data.text,
-avatar: ws.user.avatar || DEFAULT_AVATAR
-});
-}
-
-/* ---------------- FILE ---------------- */
-
-if (data.type === "file") {
-if (!ws.user) return;
-
-broadcastRoom(ws.room, {
-type: "file",
-name: ws.user.username,
-fileName: data.fileName,
-data: data.data,
-avatar: ws.user.avatar || DEFAULT_AVATAR
-});
-}
-
-/* ---------------- TYPING ---------------- */
-
-if (data.type === "typing") {
-if (!ws.user) return;
-
-broadcastRoom(ws.room, {
-type: "typing",
-name: ws.user.username
-}, ws);
-}
-
-});
-
-/* ---------------- DISCONNECT ---------------- */
-
-ws.on("close", () => {
-if (ws.room) sendOnline(ws.room);
-});
-
+  ws.on("close", () => {
+    clients.delete(ws);
+  });
 });
 
 server.listen(8080, () => {
-console.log("Server running on 8080");
+  console.log("Server running on 8080");
 });
