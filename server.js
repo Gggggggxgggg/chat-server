@@ -4,11 +4,10 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 8080;
 const server = new WebSocket.Server({ port: PORT });
 
-// ws -> user
 const users = new Map();
 
-function broadcast(obj) {
-    const msg = JSON.stringify(obj);
+function broadcast(data) {
+    const msg = JSON.stringify(data);
 
     server.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN) {
@@ -27,13 +26,11 @@ server.on("connection", (ws) => {
 
     users.set(ws, user);
 
-    console.log("User connected:", id);
+    console.log("User connected:", user.name);
 
-    // отправка инфы клиенту
     ws.send(JSON.stringify({
         type: "system",
         text: "connected",
-        id,
         name: user.name
     }));
 
@@ -53,7 +50,6 @@ server.on("connection", (ws) => {
         if (msg.type === "text") {
             broadcast({
                 type: "text",
-                id: user.id,
                 name: user.name,
                 text: msg.text,
                 time: Date.now()
@@ -64,10 +60,9 @@ server.on("connection", (ws) => {
         else if (msg.type === "file") {
             broadcast({
                 type: "file",
-                id: user.id,
                 name: user.name,
-                fileName: msg.fileName || "file",
-                fileType: msg.fileType || "unknown",
+                fileName: msg.fileName,
+                fileType: msg.fileType,
                 data: msg.data,
                 time: Date.now()
             });
@@ -76,7 +71,6 @@ server.on("connection", (ws) => {
         // ================= NAME =================
         else if (msg.type === "name") {
             user.name = msg.name || user.name;
-
             users.set(ws, user);
 
             ws.send(JSON.stringify({
@@ -89,7 +83,6 @@ server.on("connection", (ws) => {
 
     ws.on("close", () => {
         const user = users.get(ws);
-
         users.delete(ws);
 
         broadcast({
