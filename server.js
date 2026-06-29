@@ -7,15 +7,11 @@ const server = new WebSocket.Server({ port: PORT });
 server.on("connection", (ws) => {
 
     ws.on("message", (msg) => {
-
         server.clients.forEach(client => {
-
             if (client.readyState === WebSocket.OPEN) {
                 client.send(msg.toString());
             }
-
         });
-
     });
 
 });
