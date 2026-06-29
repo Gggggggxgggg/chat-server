@@ -3,17 +3,11 @@ const http = require("http");
 const WebSocket = require("ws");
 const sqlite3 = require("sqlite3").verbose();
 const bcrypt = require("bcrypt");
-const cors = require("cors");
 
 const app = express();
-app.use(cors());
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const PORT = 8080;
-
-// ================= DB =================
 const db = new sqlite3.Database("./chat.db");
 
 db.run(`
@@ -23,216 +17,142 @@ username TEXT UNIQUE,
 password TEXT,
 avatar TEXT DEFAULT '',
 birthday TEXT DEFAULT ''
-);
+)
 `);
 
-db.run(`
-CREATE TABLE IF NOT EXISTS messages (
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-room TEXT,
-sender TEXT,
-text TEXT,
-type TEXT,
-data TEXT,
-time DATETIME DEFAULT CURRENT_TIMESTAMP
+let clients = new Map();
+
+function broadcastRoom(room, data, except=null){
+wss.clients.forEach(c=>{
+if(c.readyState===1 && c.room===room && c!==except){
+c.send(JSON.stringify(data));
+}
+});
+}
+
+function sendOnline(room){
+let list=[];
+wss.clients.forEach(c=>{
+if(c.room===room && c.user){
+list.push({
+id:c.user.id,
+name:c.user.username,
+avatar:c.user.avatar
+});
+}
+});
+
+broadcastRoom(room,{type:"online",users:list});
+}
+
+wss.on("connection",(ws)=>{
+
+ws.room="global";
+
+ws.on("message",(raw)=>{
+let data;
+try{ data=JSON.parse(raw);}catch{return;}
+
+/////////////////////////////////////////////////
+// REGISTER
+/////////////////////////////////////////////////
+if(data.type==="register"){
+let hash=bcrypt.hashSync(data.password,10);
+
+db.run(
+"INSERT INTO users(username,password) VALUES(?,?)",
+[data.username,hash],
+(err)=>{
+if(err){
+ws.send(JSON.stringify({type:"error",text:"User exists"}));
+return;
+}
+ws.send(JSON.stringify({type:"login_ok"}));
+}
 );
-`);
-
-// ================= STATE =================
-const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
-
-let clients = new Map(); 
-// ws -> {id, username, avatar, birthday, room}
-
-// ================= HELPERS =================
-function broadcastRoom(room, data, exceptWs = null) {
-    wss.clients.forEach(client => {
-        const u = clients.get(client);
-        if (!u) return;
-
-        if (client.readyState === WebSocket.OPEN && u.room === room) {
-            if (client !== exceptWs) {
-                client.send(JSON.stringify(data));
-            }
-        }
-    });
 }
 
-function sendOnline(room) {
-    const list = [];
-
-    clients.forEach(u => {
-        if (u.room === room) {
-            list.push({
-                id: u.id,
-                name: u.username,
-                avatar: u.avatar || DEFAULT_AVATAR,
-                birthday: u.birthday || ""
-            });
-        }
-    });
-
-    broadcastRoom(room, {
-        type: "online",
-        users: list
-    });
+/////////////////////////////////////////////////
+// LOGIN
+/////////////////////////////////////////////////
+if(data.type==="login"){
+db.get("SELECT * FROM users WHERE username=?",[data.username],(err,u)=>{
+if(!u){
+ws.send(JSON.stringify({type:"error",text:"No user"}));
+return;
+}
+if(!bcrypt.compareSync(data.password,u.password)){
+ws.send(JSON.stringify({type:"error",text:"Wrong password"}));
+return;
 }
 
-// ================= WS =================
-wss.on("connection", (ws) => {
+ws.user=u;
+ws.send(JSON.stringify({
+type:"login_ok",
+user:u
+}));
+});
+}
 
-    ws.room = "global";
+/////////////////////////////////////////////////
+// JOIN
+/////////////////////////////////////////////////
+if(data.type==="join"){
+ws.room=data.room;
+sendOnline(ws.room);
+}
 
-    ws.on("message", (raw) => {
-        let data;
-        try { data = JSON.parse(raw.toString()); } catch { return; }
+/////////////////////////////////////////////////
+// PROFILE
+/////////////////////////////////////////////////
+if(data.type==="update_profile"){
+db.run(
+"UPDATE users SET avatar=?, birthday=? WHERE id=?",
+[data.avatar,data.birthday,ws.user.id]
+);
+ws.user.avatar=data.avatar;
+}
 
-        const user = clients.get(ws);
+/////////////////////////////////////////////////
+// TEXT
+/////////////////////////////////////////////////
+if(data.type==="text"){
+broadcastRoom(ws.room,{
+type:"text",
+name:ws.user.username,
+text:data.text,
+avatar:ws.user.avatar
+});
+}
 
-        // ================= REGISTER =================
-        if (data.type === "register") {
-            const hash = bcrypt.hashSync(data.password, 10);
+/////////////////////////////////////////////////
+// FILE
+/////////////////////////////////////////////////
+if(data.type==="file"){
+broadcastRoom(ws.room,{
+type:"file",
+name:ws.user.username,
+fileName:data.fileName,
+data:data.data,
+avatar:ws.user.avatar
+});
+}
 
-            db.run(
-                "INSERT INTO users(username,password) VALUES(?,?)",
-                [data.username, hash],
-                (err) => {
-                    if (err) {
-                        ws.send(JSON.stringify({
-                            type: "error",
-                            text: "User already exists"
-                        }));
-                        return;
-                    }
+/////////////////////////////////////////////////
+// TYPING
+/////////////////////////////////////////////////
+if(data.type==="typing"){
+broadcastRoom(ws.room,{
+type:"typing",
+name:ws.user.username
+},ws);
+}
 
-                    ws.send(JSON.stringify({ type: "login_ok" }));
-                }
-            );
-        }
-
-        // ================= LOGIN =================
-        if (data.type === "login") {
-            db.get(
-                "SELECT * FROM users WHERE username=?",
-                [data.username],
-                (err, row) => {
-
-                    if (!row) {
-                        ws.send(JSON.stringify({ type: "error", text: "User not found" }));
-                        return;
-                    }
-
-                    if (!bcrypt.compareSync(data.password, row.password)) {
-                        ws.send(JSON.stringify({ type: "error", text: "Wrong password" }));
-                        return;
-                    }
-
-                    const u = {
-                        id: row.id,
-                        username: row.username,
-                        avatar: row.avatar || DEFAULT_AVATAR,
-                        birthday: row.birthday || "",
-                        room: "global"
-                    };
-
-                    clients.set(ws, u);
-
-                    ws.send(JSON.stringify({
-                        type: "login_ok",
-                        user: u
-                    }));
-
-                    sendOnline(u.room);
-                }
-            );
-        }
-
-        // ================= JOIN ROOM =================
-        if (data.type === "join") {
-            const u = clients.get(ws);
-            if (!u) return;
-
-            u.room = data.room;
-            ws.room = data.room;
-
-            clients.set(ws, u);
-
-            sendOnline(data.room);
-        }
-
-        // ================= UPDATE PROFILE =================
-        if (data.type === "update_profile") {
-            const u = clients.get(ws);
-            if (!u) return;
-
-            u.avatar = data.avatar || u.avatar;
-            u.birthday = data.birthday || u.birthday;
-
-            clients.set(ws, u);
-
-            db.run(
-                "UPDATE users SET avatar=?, birthday=? WHERE id=?",
-                [u.avatar, u.birthday, u.id]
-            );
-
-            sendOnline(u.room);
-        }
-
-        // ================= TEXT =================
-        if (data.type === "text") {
-            const u = clients.get(ws);
-            if (!u) return;
-
-            const msg = {
-                type: "text",
-                name: u.username,
-                text: data.text,
-                avatar: u.avatar
-            };
-
-            db.run(
-                "INSERT INTO messages(room,sender,text,type,data) VALUES(?,?,?,?,?)",
-                [u.room, u.username, data.text, "text", ""]
-            );
-
-            broadcastRoom(u.room, msg);
-        }
-
-        // ================= FILE =================
-        if (data.type === "file") {
-            const u = clients.get(ws);
-            if (!u) return;
-
-            const msg = {
-                type: "file",
-                name: u.username,
-                avatar: u.avatar,
-                fileName: data.fileName,
-                fileType: data.fileType,
-                data: data.data
-            };
-
-            broadcastRoom(u.room, msg);
-        }
-
-        // ================= TYPING =================
-        if (data.type === "typing") {
-            const u = clients.get(ws);
-            if (!u) return;
-
-            broadcastRoom(u.room, {
-                type: "typing",
-                name: u.username
-            }, ws);
-        }
-    });
-
-    // ================= DISCONNECT =================
-    ws.on("close", () => {
-        clients.delete(ws);
-    });
 });
 
-server.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+ws.on("close",()=>{
+sendOnline(ws.room);
 });
+});
+
+server.listen(8080,()=>console.log("Server running"));
