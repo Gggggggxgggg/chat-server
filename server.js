@@ -1,202 +1,194 @@
+const express = require("express");
+const http = require("http");
 const WebSocket = require("ws");
-const crypto = require("crypto");
 const sqlite3 = require("sqlite3").verbose();
+const bcrypt = require("bcrypt");
 
-const PORT = process.env.PORT || 8080;
-const server = new WebSocket.Server({ port: PORT });
-
-// ================= DB =================
-const db = new sqlite3.Database("./database.db");
-
-db.serialize(() => {
-db.run(`
-CREATE TABLE IF NOT EXISTS users (
-id TEXT PRIMARY KEY,
-name TEXT,
-password TEXT,
-avatar TEXT
-)
-`);
-
-db.run(`
-CREATE TABLE IF NOT EXISTS messages (
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-room TEXT,
-fromUser TEXT,
-toUser TEXT,
-text TEXT,
-type TEXT,
-time INTEGER
-)
-`);
-});
-
-// ================= USERS =================
-const clients = new Map();
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
-// ================= BROADCAST ROOM =================
-function sendToRoom(room, data){
-server.clients.forEach(c=>{
-const u = clients.get(c);
-if(c.readyState === WebSocket.OPEN && u?.room === room){
+const db = new sqlite3.Database("./chat.db");
+
+db.run(`
+CREATE TABLE IF NOT EXISTS users (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+username TEXT UNIQUE,
+password TEXT,
+avatar TEXT DEFAULT '',
+birthday TEXT DEFAULT ''
+);
+`);
+
+let clients = new Map();
+
+/* ---------------- ROOM BROADCAST ---------------- */
+
+function broadcastRoom(room, data, except = null) {
+wss.clients.forEach(c => {
+if (c.readyState === 1 && c.room === room && c !== except) {
 c.send(JSON.stringify(data));
 }
 });
 }
 
-// ================= ONLINE =================
-function sendOnline(room){
-const list = [];
+/* ---------------- ONLINE ---------------- */
 
-clients.forEach(u=>{
-if(u.room === room){
-list.push({
-id:u.id,
-name:u.name,
-avatar:u.avatar
+function sendOnline(room) {
+let users = [];
+
+wss.clients.forEach(c => {
+if (c.room === room && c.user) {
+users.push({
+id: c.user.id,
+name: c.user.username,
+avatar: c.user.avatar || DEFAULT_AVATAR
 });
 }
 });
 
-sendToRoom(room,{
-type:"online",
-users:list
+broadcastRoom(room, {
+type: "online",
+users
 });
 }
 
-// ================= CONNECTION =================
-server.on("connection",(ws)=>{
-const id = crypto.randomUUID();
+/* ---------------- CONNECTION ---------------- */
 
-const user = {
-id,
-name:"Guest_"+id.slice(0,5),
-room:"global",
-avatar:DEFAULT_AVATAR
-};
+wss.on("connection", (ws) => {
 
-clients.set(ws,user);
+ws.room = "global";
+ws.user = null;
 
-sendOnline(user.room);
+/* ---------------- MESSAGE ---------------- */
 
-ws.on("message",(raw)=>{
-let msg;
-try{ msg = JSON.parse(raw.toString()); }catch{return;}
+ws.on("message", (raw) => {
+let data;
+try { data = JSON.parse(raw); } catch { return; }
 
-const u = clients.get(ws);
-if(!u) return;
+/* ---------------- REGISTER ---------------- */
 
-// ================= REGISTER =================
-if(msg.type==="register"){
-db.get("SELECT * FROM users WHERE name=?",[msg.username],(err,row)=>{
-if(row){
-ws.send(JSON.stringify({type:"error",text:"User exists"}));
+if (data.type === "register") {
+let hash = bcrypt.hashSync(data.password, 10);
+
+db.run(
+"INSERT INTO users(username,password,avatar) VALUES(?,?,?)",
+[data.username, hash, DEFAULT_AVATAR],
+(err) => {
+if (err) {
+ws.send(JSON.stringify({ type: "error", text: "User exists" }));
 return;
 }
 
-const id = crypto.randomUUID();
-
-db.run(
-"INSERT INTO users VALUES (?,?,?,?)",
-[id,msg.username,msg.password,DEFAULT_AVATAR]
+ws.send(JSON.stringify({ type: "login_ok" }));
+}
 );
-
-ws.send(JSON.stringify({type:"login_ok"}));
-});
 }
 
-// ================= LOGIN =================
-if(msg.type==="login"){
+/* ---------------- LOGIN ---------------- */
+
+if (data.type === "login") {
 db.get(
-"SELECT * FROM users WHERE name=? AND password=?",
-[msg.username,msg.password],
-(err,row)=>{
+"SELECT * FROM users WHERE username=?",
+[data.username],
+(err, user) => {
 
-if(!row){
-ws.send(JSON.stringify({type:"error",text:"Wrong login"}));
+if (!user) {
+ws.send(JSON.stringify({ type: "error", text: "No user" }));
 return;
 }
 
-u.name = row.name;
-u.avatar = row.avatar;
-clients.set(ws,u);
-
-ws.send(JSON.stringify({type:"login_ok"}));
-sendOnline(u.room);
-});
+if (!bcrypt.compareSync(data.password, user.password)) {
+ws.send(JSON.stringify({ type: "error", text: "Wrong password" }));
+return;
 }
 
-// ================= JOIN =================
-if(msg.type==="join"){
-u.room = msg.room;
-clients.set(ws,u);
-sendOnline(u.room);
-}
-
-// ================= TEXT =================
-if(msg.type==="text"){
-const data = {
-type:"text",
-name:u.name,
-avatar:u.avatar,
-text:msg.text,
-room:u.room
+ws.user = {
+...user,
+avatar: user.avatar || DEFAULT_AVATAR
 };
 
-db.run(
-"INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
-[u.room,u.name,msg.text,"text",Date.now()]
-);
-
-sendToRoom(u.room,data);
-}
-
-// ================= FILE =================
-if(msg.type==="file"){
-sendToRoom(u.room,{
-type:"file",
-name:u.name,
-avatar:u.avatar,
-fileName:msg.fileName,
-fileType:msg.fileType,
-data:msg.data
-});
-}
-
-// ================= DM =================
-if(msg.type==="dm"){
-const targetId = msg.to;
-
-server.clients.forEach(c=>{
-const t = clients.get(c);
-
-if(t && t.id === targetId){
-c.send(JSON.stringify({
-type:"dm",
-from:u.id,
-name:u.name,
-text:msg.text
+ws.send(JSON.stringify({
+type: "login_ok",
+user: ws.user
 }));
 }
+);
+}
+
+/* ---------------- JOIN ---------------- */
+
+if (data.type === "join") {
+ws.room = data.room || "global";
+sendOnline(ws.room);
+}
+
+/* ---------------- PROFILE UPDATE ---------------- */
+
+if (data.type === "update_profile") {
+if (!ws.user) return;
+
+const avatar = data.avatar || DEFAULT_AVATAR;
+
+db.run(
+"UPDATE users SET avatar=?, birthday=? WHERE id=?",
+[avatar, data.birthday || "", ws.user.id]
+);
+
+ws.user.avatar = avatar;
+ws.user.birthday = data.birthday;
+}
+
+/* ---------------- TEXT ---------------- */
+
+if (data.type === "text") {
+if (!ws.user) return;
+
+broadcastRoom(ws.room, {
+type: "text",
+name: ws.user.username,
+text: data.text,
+avatar: ws.user.avatar || DEFAULT_AVATAR
 });
 }
 
-// ================= TYPING =================
-if(msg.type==="typing"){
-sendToRoom(u.room,{
-type:"typing",
-name:u.name
+/* ---------------- FILE ---------------- */
+
+if (data.type === "file") {
+if (!ws.user) return;
+
+broadcastRoom(ws.room, {
+type: "file",
+name: ws.user.username,
+fileName: data.fileName,
+data: data.data,
+avatar: ws.user.avatar || DEFAULT_AVATAR
 });
+}
+
+/* ---------------- TYPING ---------------- */
+
+if (data.type === "typing") {
+if (!ws.user) return;
+
+broadcastRoom(ws.room, {
+type: "typing",
+name: ws.user.username
+}, ws);
 }
 
 });
 
-// ================= CLOSE =================
-ws.on("close",()=>{
-clients.delete(ws);
-});
+/* ---------------- DISCONNECT ---------------- */
+
+ws.on("close", () => {
+if (ws.room) sendOnline(ws.room);
 });
 
-console.log("Server running on port " + PORT);
+});
+
+server.listen(8080, () => {
+console.log("Server running on 8080");
+});
