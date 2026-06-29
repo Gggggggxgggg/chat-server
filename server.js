@@ -1,158 +1,202 @@
-const express = require("express");
-const http = require("http");
 const WebSocket = require("ws");
+const crypto = require("crypto");
 const sqlite3 = require("sqlite3").verbose();
-const bcrypt = require("bcrypt");
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 8080;
+const server = new WebSocket.Server({ port: PORT });
 
-const db = new sqlite3.Database("./chat.db");
+// ================= DB =================
+const db = new sqlite3.Database("./database.db");
 
+db.serialize(() => {
 db.run(`
 CREATE TABLE IF NOT EXISTS users (
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-username TEXT UNIQUE,
+id TEXT PRIMARY KEY,
+name TEXT,
 password TEXT,
-avatar TEXT DEFAULT '',
-birthday TEXT DEFAULT ''
+avatar TEXT
 )
 `);
 
-let clients = new Map();
+db.run(`
+CREATE TABLE IF NOT EXISTS messages (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+room TEXT,
+fromUser TEXT,
+toUser TEXT,
+text TEXT,
+type TEXT,
+time INTEGER
+)
+`);
+});
 
-function broadcastRoom(room, data, except=null){
-wss.clients.forEach(c=>{
-if(c.readyState===1 && c.room===room && c!==except){
+// ================= USERS =================
+const clients = new Map();
+
+const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
+
+// ================= BROADCAST ROOM =================
+function sendToRoom(room, data){
+server.clients.forEach(c=>{
+const u = clients.get(c);
+if(c.readyState === WebSocket.OPEN && u?.room === room){
 c.send(JSON.stringify(data));
 }
 });
 }
 
+// ================= ONLINE =================
 function sendOnline(room){
-let list=[];
-wss.clients.forEach(c=>{
-if(c.room===room && c.user){
+const list = [];
+
+clients.forEach(u=>{
+if(u.room === room){
 list.push({
-id:c.user.id,
-name:c.user.username,
-avatar:c.user.avatar
+id:u.id,
+name:u.name,
+avatar:u.avatar
 });
 }
 });
 
-broadcastRoom(room,{type:"online",users:list});
+sendToRoom(room,{
+type:"online",
+users:list
+});
 }
 
-wss.on("connection",(ws)=>{
+// ================= CONNECTION =================
+server.on("connection",(ws)=>{
+const id = crypto.randomUUID();
 
-ws.room="global";
+const user = {
+id,
+name:"Guest_"+id.slice(0,5),
+room:"global",
+avatar:DEFAULT_AVATAR
+};
+
+clients.set(ws,user);
+
+sendOnline(user.room);
 
 ws.on("message",(raw)=>{
-let data;
-try{ data=JSON.parse(raw);}catch{return;}
+let msg;
+try{ msg = JSON.parse(raw.toString()); }catch{return;}
 
-/////////////////////////////////////////////////
-// REGISTER
-/////////////////////////////////////////////////
-if(data.type==="register"){
-let hash=bcrypt.hashSync(data.password,10);
+const u = clients.get(ws);
+if(!u) return;
 
-db.run(
-"INSERT INTO users(username,password) VALUES(?,?)",
-[data.username,hash],
-(err)=>{
-if(err){
+// ================= REGISTER =================
+if(msg.type==="register"){
+db.get("SELECT * FROM users WHERE name=?",[msg.username],(err,row)=>{
+if(row){
 ws.send(JSON.stringify({type:"error",text:"User exists"}));
 return;
 }
-ws.send(JSON.stringify({type:"login_ok"}));
-}
-);
-}
 
-/////////////////////////////////////////////////
-// LOGIN
-/////////////////////////////////////////////////
-if(data.type==="login"){
-db.get("SELECT * FROM users WHERE username=?",[data.username],(err,u)=>{
-if(!u){
-ws.send(JSON.stringify({type:"error",text:"No user"}));
-return;
-}
-if(!bcrypt.compareSync(data.password,u.password)){
-ws.send(JSON.stringify({type:"error",text:"Wrong password"}));
-return;
-}
+const id = crypto.randomUUID();
 
-ws.user=u;
-ws.send(JSON.stringify({
-type:"login_ok",
-user:u
-}));
-});
-}
-
-/////////////////////////////////////////////////
-// JOIN
-/////////////////////////////////////////////////
-if(data.type==="join"){
-ws.room=data.room;
-sendOnline(ws.room);
-}
-
-/////////////////////////////////////////////////
-// PROFILE
-/////////////////////////////////////////////////
-if(data.type==="update_profile"){
 db.run(
-"UPDATE users SET avatar=?, birthday=? WHERE id=?",
-[data.avatar,data.birthday,ws.user.id]
+"INSERT INTO users VALUES (?,?,?,?)",
+[id,msg.username,msg.password,DEFAULT_AVATAR]
 );
-ws.user.avatar=data.avatar;
+
+ws.send(JSON.stringify({type:"login_ok"}));
+});
 }
 
-/////////////////////////////////////////////////
-// TEXT
-/////////////////////////////////////////////////
-if(data.type==="text"){
-broadcastRoom(ws.room,{
+// ================= LOGIN =================
+if(msg.type==="login"){
+db.get(
+"SELECT * FROM users WHERE name=? AND password=?",
+[msg.username,msg.password],
+(err,row)=>{
+
+if(!row){
+ws.send(JSON.stringify({type:"error",text:"Wrong login"}));
+return;
+}
+
+u.name = row.name;
+u.avatar = row.avatar;
+clients.set(ws,u);
+
+ws.send(JSON.stringify({type:"login_ok"}));
+sendOnline(u.room);
+});
+}
+
+// ================= JOIN =================
+if(msg.type==="join"){
+u.room = msg.room;
+clients.set(ws,u);
+sendOnline(u.room);
+}
+
+// ================= TEXT =================
+if(msg.type==="text"){
+const data = {
 type:"text",
-name:ws.user.username,
-text:data.text,
-avatar:ws.user.avatar
-});
+name:u.name,
+avatar:u.avatar,
+text:msg.text,
+room:u.room
+};
+
+db.run(
+"INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
+[u.room,u.name,msg.text,"text",Date.now()]
+);
+
+sendToRoom(u.room,data);
 }
 
-/////////////////////////////////////////////////
-// FILE
-/////////////////////////////////////////////////
-if(data.type==="file"){
-broadcastRoom(ws.room,{
+// ================= FILE =================
+if(msg.type==="file"){
+sendToRoom(u.room,{
 type:"file",
-name:ws.user.username,
-fileName:data.fileName,
-data:data.data,
-avatar:ws.user.avatar
+name:u.name,
+avatar:u.avatar,
+fileName:msg.fileName,
+fileType:msg.fileType,
+data:msg.data
 });
 }
 
-/////////////////////////////////////////////////
-// TYPING
-/////////////////////////////////////////////////
-if(data.type==="typing"){
-broadcastRoom(ws.room,{
+// ================= DM =================
+if(msg.type==="dm"){
+const targetId = msg.to;
+
+server.clients.forEach(c=>{
+const t = clients.get(c);
+
+if(t && t.id === targetId){
+c.send(JSON.stringify({
+type:"dm",
+from:u.id,
+name:u.name,
+text:msg.text
+}));
+}
+});
+}
+
+// ================= TYPING =================
+if(msg.type==="typing"){
+sendToRoom(u.room,{
 type:"typing",
-name:ws.user.username
-},ws);
+name:u.name
+});
 }
 
 });
 
+// ================= CLOSE =================
 ws.on("close",()=>{
-sendOnline(ws.room);
+clients.delete(ws);
 });
 });
 
-server.listen(8080,()=>console.log("Server running"));
+console.log("Server running on port " + PORT);
