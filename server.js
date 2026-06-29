@@ -6,6 +6,9 @@ const server = new WebSocket.Server({ port: PORT });
 
 const users = new Map();
 
+const DEFAULT_AVATAR =
+"https://i.imgur.com/8pyk61L.png";
+
 function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
 
@@ -45,7 +48,7 @@ server.on("connection", (ws) => {
         id,
         name: "Guest_" + id.slice(0, 5),
         room: "global",
-        avatar: "https://api.dicebear.com/7.x/bottts/svg?seed=" + id
+        avatar: DEFAULT_AVATAR
     };
 
     users.set(ws, user);
@@ -64,7 +67,7 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         if (!user) return;
 
-        // ROOM SWITCH
+        // JOIN ROOM
         if (msg.type === "join") {
             user.room = msg.room;
             users.set(ws, user);
@@ -82,37 +85,22 @@ server.on("connection", (ws) => {
             });
         }
 
-        // FILE (image/video)
-        if (msg.type === "file") {
-            broadcastRoom(user.room, {
-                type: "file",
-                name: user.name,
-                avatar: user.avatar,
-                fileType: msg.fileType,
-                data: msg.data,
-                fileName: msg.fileName
-            });
-        }
-
-        // AVATAR
-        if (msg.type === "avatar") {
-            user.avatar = msg.data;
-            users.set(ws, user);
-            sendOnline(user.room);
-        }
-
-        // NAME
+        // CHANGE NAME (ВАЖНО)
         if (msg.type === "name") {
             user.name = msg.name;
             users.set(ws, user);
             sendOnline(user.room);
         }
 
-        // TYPING
-        if (msg.type === "typing") {
+        // FILE
+        if (msg.type === "file") {
             broadcastRoom(user.room, {
-                type: "typing",
-                name: user.name
+                type: "file",
+                name: user.name,
+                avatar: user.avatar,
+                fileType: msg.fileType,
+                fileName: msg.fileName,
+                data: msg.data
             });
         }
     });
@@ -125,4 +113,4 @@ server.on("connection", (ws) => {
     });
 });
 
-console.log("🚀 Server running on port " + PORT);
+console.log("Server running on " + PORT);
