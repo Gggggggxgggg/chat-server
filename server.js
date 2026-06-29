@@ -6,8 +6,7 @@ const server = new WebSocket.Server({ port: PORT });
 
 const users = new Map();
 
-const DEFAULT_AVATAR =
-"https://i.imgur.com/8pyk61L.png";
+const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
 function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
@@ -30,7 +29,7 @@ function sendOnline(room) {
             list.push({
                 id: u.id,
                 name: u.name,
-                avatar: u.avatar
+                avatar: DEFAULT_AVATAR
             });
         }
     });
@@ -52,7 +51,6 @@ server.on("connection", (ws) => {
     };
 
     users.set(ws, user);
-
     sendOnline(user.room);
 
     ws.on("message", (raw) => {
@@ -80,16 +78,18 @@ server.on("connection", (ws) => {
             broadcastRoom(user.room, {
                 type: "text",
                 name: user.name,
-                avatar: user.avatar,
+                avatar: DEFAULT_AVATAR,
                 text: msg.text
             });
         }
 
-        // CHANGE NAME (ВАЖНО)
+        // NAME FIX (ВАЖНО)
         if (msg.type === "name") {
-            user.name = msg.name;
+            user.name = msg.name || user.name;
             users.set(ws, user);
-            sendOnline(user.room);
+
+            sendOnline(user.room); // ОБНОВЛЯЕТ ВСЕХ
+            return;
         }
 
         // FILE
@@ -97,10 +97,18 @@ server.on("connection", (ws) => {
             broadcastRoom(user.room, {
                 type: "file",
                 name: user.name,
-                avatar: user.avatar,
+                avatar: DEFAULT_AVATAR,
                 fileType: msg.fileType,
                 fileName: msg.fileName,
                 data: msg.data
+            });
+        }
+
+        // TYPING FIX
+        if (msg.type === "typing") {
+            broadcastRoom(user.room, {
+                type: "typing",
+                name: user.name
             });
         }
     });
