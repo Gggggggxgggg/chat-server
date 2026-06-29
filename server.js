@@ -1,5 +1,7 @@
 const WebSocket = require("ws");
 const crypto = require("crypto");
+const fs = require("fs");
+const sqlite3 = require("sqlite3").verbose();
 
 const PORT = process.env.PORT || 8080;
 const server = new WebSocket.Server({ port: PORT });
@@ -7,6 +9,47 @@ const server = new WebSocket.Server({ port: PORT });
 const users = new Map();
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
+
+// -------------------- DATABASE --------------------
+
+if (!fs.existsSync("./database")) {
+    fs.mkdirSync("./database");
+}
+
+const db = new sqlite3.Database("./database/chat.db");
+
+// таблица сообщений
+db.run(`
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room TEXT,
+    name TEXT,
+    type TEXT,
+    text TEXT,
+    fileType TEXT,
+    fileName TEXT,
+    data TEXT,
+    time INTEGER
+)
+`);
+
+// -------------------- HELPERS --------------------
+
+function saveMessage(msg, user) {
+    db.run(`
+        INSERT INTO messages (room, name, type, text, fileType, fileName, data, time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+        user.room,
+        user.name,
+        msg.type,
+        msg.text || "",
+        msg.fileType || "",
+        msg.fileName || "",
+        msg.data || "",
+        Date.now()
+    ]);
+}
 
 function broadcastRoom(room, data) {
     const msg = JSON.stringify(data);
@@ -40,22 +83,24 @@ function sendOnline(room) {
     });
 }
 
+// -------------------- SERVER --------------------
+
 server.on("connection", (ws) => {
-    const id = crypto.randomUUID();
 
     const user = {
-        id,
-        name: "Guest_" + id.slice(0, 5),
+        id: crypto.randomUUID(),
+        name: "Guest_" + Math.floor(Math.random() * 9999),
         room: "global",
         avatar: DEFAULT_AVATAR
     };
 
     users.set(ws, user);
+
     sendOnline(user.room);
 
     ws.on("message", (raw) => {
-        let msg;
 
+        let msg;
         try {
             msg = JSON.parse(raw.toString());
         } catch {
@@ -65,46 +110,55 @@ server.on("connection", (ws) => {
         const user = users.get(ws);
         if (!user) return;
 
-        // JOIN ROOM
+        // ---------------- JOIN ----------------
         if (msg.type === "join") {
             user.room = msg.room;
             users.set(ws, user);
+
             sendOnline(user.room);
             return;
         }
 
-        // TEXT
+        // ---------------- TEXT ----------------
         if (msg.type === "text") {
-            broadcastRoom(user.room, {
+
+            const data = {
                 type: "text",
                 name: user.name,
                 avatar: DEFAULT_AVATAR,
                 text: msg.text
-            });
+            };
+
+            broadcastRoom(user.room, data);
+            saveMessage(data, user);
         }
 
-        // NAME FIX (ВАЖНО)
+        // ---------------- NAME ----------------
         if (msg.type === "name") {
             user.name = msg.name || user.name;
             users.set(ws, user);
 
-            sendOnline(user.room); // ОБНОВЛЯЕТ ВСЕХ
+            sendOnline(user.room);
             return;
         }
 
-        // FILE
+        // ---------------- FILE ----------------
         if (msg.type === "file") {
-            broadcastRoom(user.room, {
+
+            const data = {
                 type: "file",
                 name: user.name,
                 avatar: DEFAULT_AVATAR,
                 fileType: msg.fileType,
                 fileName: msg.fileName,
                 data: msg.data
-            });
+            };
+
+            broadcastRoom(user.room, data);
+            saveMessage(data, user);
         }
 
-        // TYPING FIX
+        // ---------------- TYPING ----------------
         if (msg.type === "typing") {
             broadcastRoom(user.room, {
                 type: "typing",
@@ -121,4 +175,4 @@ server.on("connection", (ws) => {
     });
 });
 
-console.log("Server running on " + PORT);
+console.log("🚀 Server running on port " + PORT);
