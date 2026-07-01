@@ -7,7 +7,6 @@ const server = new WebSocket.Server({ port: PORT });
 
 const db = new sqlite3.Database("./database.db");
 
-// DB
 db.serialize(() => {
 db.run(`
 CREATE TABLE IF NOT EXISTS users (
@@ -23,7 +22,6 @@ CREATE TABLE IF NOT EXISTS messages (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 room TEXT,
 fromUser TEXT,
-toUser TEXT,
 text TEXT,
 type TEXT,
 time INTEGER
@@ -35,149 +33,122 @@ const clients = new Map();
 
 const DEFAULT_AVATAR = "https://i.imgur.com/8pyk61L.png";
 
-// ROOM SEND
+function randomColor(){
+    return "#" + Math.floor(Math.random()*16777215).toString(16);
+}
+
+/* SEND ROOM */
 function sendToRoom(room, data){
-server.clients.forEach(c=>{
-const u = clients.get(c);
-if(c.readyState === WebSocket.OPEN && u?.room === room){
-c.send(JSON.stringify(data));
-}
-});
+    server.clients.forEach(c=>{
+        const u = clients.get(c);
+        if(c.readyState === WebSocket.OPEN && u?.room === room){
+            c.send(JSON.stringify(data));
+        }
+    });
 }
 
-// ONLINE
+/* ONLINE */
 function sendOnline(room){
-const list = [];
+    const list = [];
 
-clients.forEach(u=>{
-if(u.room === room){
-list.push({
-id:u.id,
-name:u.name,
-avatar:u.avatar
-});
-}
-});
+    clients.forEach(u=>{
+        if(u.room === room){
+            list.push({
+                id:u.id,
+                name:u.name,
+                avatar:u.avatar,
+                color:u.color
+            });
+        }
+    });
 
-sendToRoom(room,{
-type:"online",
-users:list
-});
+    sendToRoom(room,{
+        type:"online",
+        users:list
+    });
 }
 
 server.on("connection",(ws)=>{
 
-const id = crypto.randomUUID();
+    const id = crypto.randomUUID();
 
-const user = {
-id,
-name:"Guest_"+id.slice(0,5),
-room:"global",
-avatar:DEFAULT_AVATAR
-};
+    const user = {
+        id,
+        name:"Guest_"+id.slice(0,5),
+        room:"global",
+        avatar:DEFAULT_AVATAR,
+        color: randomColor()
+    };
 
-clients.set(ws,user);
+    clients.set(ws,user);
 
-sendOnline("global");
+    sendOnline("global");
 
-ws.on("message",(raw)=>{
-let msg;
-try{ msg = JSON.parse(raw.toString()); }catch{return;}
+    ws.on("message",(raw)=>{
+        let msg;
+        try{ msg = JSON.parse(raw.toString()); }catch{return;}
 
-const u = clients.get(ws);
-if(!u) return;
+        const u = clients.get(ws);
+        if(!u) return;
 
-// REGISTER
-if(msg.type==="register"){
-db.get("SELECT * FROM users WHERE name=?",[msg.username],(err,row)=>{
-if(row){
-ws.send(JSON.stringify({type:"error",text:"User exists"}));
-return;
-}
+        /* JOIN */
+        if(msg.type==="join"){
 
-const id = crypto.randomUUID();
+            u.room = msg.room || "global";
 
-db.run(
-"INSERT INTO users VALUES (?,?,?,?)",
-[id,msg.username,msg.password,DEFAULT_AVATAR]
-);
+            if(msg.name && msg.name.trim()){
+                u.name = msg.name.trim();
+            }
 
-ws.send(JSON.stringify({type:"login_ok"}));
-});
-}
+            clients.set(ws,u);
 
-// LOGIN
-if(msg.type==="login"){
-db.get(
-"SELECT * FROM users WHERE name=? AND password=?",
-[msg.username,msg.password],
-(err,row)=>{
+            sendOnline(u.room);
+        }
 
-if(!row){
-ws.send(JSON.stringify({type:"error",text:"Wrong login"}));
-return;
-}
+        /* TEXT */
+        if(msg.type==="text"){
+            const data = {
+                type:"text",
+                name:u.name,
+                avatar:u.avatar,
+                color:u.color,
+                text:msg.text,
+                room:u.room
+            };
 
-u.name = row.name;
-u.avatar = row.avatar;
+            db.run(
+                "INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
+                [u.room,u.name,msg.text,"text",Date.now()]
+            );
 
-clients.set(ws,u);
+            sendToRoom(u.room,data);
+        }
 
-ws.send(JSON.stringify({type:"login_ok"}));
-sendOnline(u.room);
-});
-}
+        /* FILE */
+        if(msg.type==="file"){
+            sendToRoom(u.room,{
+                type:"file",
+                name:u.name,
+                avatar:u.avatar,
+                color:u.color,
+                fileName:msg.fileName,
+                fileType:msg.fileType,
+                data:msg.data
+            });
+        }
 
-// JOIN
-if(msg.type==="join"){
-u.room = msg.room;
-clients.set(ws,u);
-sendOnline(u.room);
-}
+        /* TYPING */
+        if(msg.type==="typing"){
+            sendToRoom(u.room,{
+                type:"typing",
+                name:u.name
+            });
+        }
+    });
 
-// TEXT
-if(msg.type==="text"){
-const data = {
-type:"text",
-name:u.name,
-avatar:u.avatar,
-text:msg.text,
-room:u.room
-};
-
-db.run(
-"INSERT INTO messages(room,fromUser,text,type,time) VALUES (?,?,?,?,?)",
-[u.room,u.name,msg.text,"text",Date.now()]
-);
-
-sendToRoom(u.room,data);
-}
-
-// FILE
-if(msg.type==="file"){
-sendToRoom(u.room,{
-type:"file",
-name:u.name,
-avatar:u.avatar,
-fileName:msg.fileName,
-fileType:msg.fileType,
-data:msg.data
-});
-}
-
-// TYPING
-if(msg.type==="typing"){
-sendToRoom(u.room,{
-type:"typing",
-name:u.name
-});
-}
-
+    ws.on("close",()=>{
+        clients.delete(ws);
+    });
 });
 
-ws.on("close",()=>{
-clients.delete(ws);
-});
-});
-
-console.log("Server running on port " + PORT);
+console.log("Server running on " + PORT);
