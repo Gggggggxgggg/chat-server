@@ -3,93 +3,177 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 
+
 const app = express();
 
 app.use(cors());
 
-app.get("/", (req, res) => {
-    res.send("chat server online");
+
+app.get("/", (req,res)=>{
+    res.send("Realtime chat server is online");
 });
+
 
 const server = http.createServer(app);
 
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
+
+const io = new Server(server,{
+
+    cors:{
+        origin:"*",
+        methods:["GET","POST"]
     }
+
 });
 
 
 let rooms = {};
 
-io.on("connection", (socket) => {
-
-    console.log("user connected");
 
 
-    socket.on("joinRoom", ({room, name}) => {
+io.on("connection",(socket)=>{
+
+
+    console.log("connected:",socket.id);
+
+
+
+    socket.on("joinRoom",(data)=>{
+
+
+        let room=data.room || "general";
+        let name=data.name || "Guest";
+
+
+        socket.room=room;
+        socket.name=name;
+
 
         socket.join(room);
 
-        socket.room = room;
-        socket.name = name;
 
 
-        if(!rooms[room])
-            rooms[room] = 0;
+        if(!rooms[room]){
+            rooms[room]=[];
+        }
 
 
-        rooms[room]++;
+        rooms[room].push(socket.id);
 
 
-        io.to(room).emit("system", {
-            text: `${name} joined ${room}`
+
+        io.to(room).emit("system",{
+            text:`${name} joined the room`
         });
 
 
-        io.to(room).emit("roomInfo", {
-            room,
-            users: rooms[room]
+
+        io.to(room).emit("roomInfo",{
+
+            room:room,
+
+            users:rooms[room].length
+
         });
+
+
 
     });
 
 
 
-    socket.on("message", (data)=>{
 
-        io.to(data.room).emit("message", {
+
+    socket.on("message",(data)=>{
+
+
+        io.to(data.room).emit("message",{
+
             name:data.name,
-            text:data.text
+
+            text:data.text,
+
+            avatar:"https://i.imgur.com/8pyk61L.png"
+
         });
+
 
     });
 
 
 
-    socket.on("disconnect", ()=>{
 
-        if(socket.room){
 
-            rooms[socket.room]--;
 
-            io.to(socket.room).emit("roomInfo",{
-                room:socket.room,
-                users:rooms[socket.room]
+    socket.on("typing",(data)=>{
+
+
+        socket.to(data.room).emit("typing",{
+
+            name:data.name
+
+        });
+
+
+    });
+
+
+
+
+
+
+
+
+    socket.on("disconnect",()=>{
+
+
+        let room=socket.room;
+
+
+        if(room && rooms[room]){
+
+
+            rooms[room]=rooms[room].filter(
+
+                id=>id!==socket.id
+
+            );
+
+
+            io.to(room).emit("roomInfo",{
+
+                room:room,
+
+                users:rooms[room].length
+
             });
+
 
         }
 
-        console.log("user disconnected");
+
+
+        console.log("disconnected:",socket.id);
+
 
     });
+
+
 
 });
 
 
-const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, ()=>{
-    console.log("server started on port", PORT);
+
+
+const PORT=process.env.PORT || 3000;
+
+
+server.listen(PORT,()=>{
+
+    console.log(
+        "server running on port",
+        PORT
+    );
+
 });
